@@ -1,0 +1,651 @@
+# 由 patch_v7.yml 裁剪而来：只编译 RouterOS v7 的 x86 版本，产物发布到 GitHub Releases。
+# 已移除：CHR 镜像构建、arm64 全部分支、自建源站 lftp 上传、Cloudflare 缓存清理、Update_Release job。
+name: Patch RouterOS v7 (x86 only)
+
+# 只用 GITHUB_TOKEN 的 contents 写权限（删旧 tag / 建 Release）；
+# 显式声明后其余权限一律为 none，actions/cache 与 upload-artifact 走运行时 token，不受影响。
+permissions:
+  contents: write
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      channels:
+        required: true
+        type: string
+      release:
+        required: true
+        type: boolean
+      buildtime:
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RouterOS v7 version, e.g. 7.19.4'
+        required: true
+        type: string
+      channels:
+        description: 'Channels, JSON array, e.g. ["stable"]'
+        required: false
+        default: '["stable"]'
+        type: string
+      release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+      buildtime:
+        description: 'build timestamp, leave empty for original'
+        required: false
+        default: ''
+        type: string
+
+env:
+  CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+  CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
+  CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+  CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
+  CUSTOM_CLOUD_PUBLIC_KEY: ${{ secrets.CUSTOM_CLOUD_PUBLIC_KEY }}
+  MIKRO_LICENSE_PUBLIC_KEY: ${{ secrets.MIKRO_LICENSE_PUBLIC_KEY }}
+  MIKRO_NPK_SIGN_PUBLIC_KEY: ${{ secrets.MIKRO_NPK_SIGN_PUBLIC_KEY }}
+  MIKRO_CLOUD_PUBLIC_KEY: ${{ secrets.MIKRO_CLOUD_PUBLIC_KEY }}
+  MIKRO_LICENCE_URL: ${{ secrets.MIKRO_LICENCE_URL }}
+  CUSTOM_LICENCE_URL: ${{ secrets.CUSTOM_LICENCE_URL }}
+  MIKRO_UPGRADE_URL: ${{ secrets.MIKRO_UPGRADE_URL }}
+  CUSTOM_UPGRADE_URL: ${{ secrets.CUSTOM_UPGRADE_URL }}
+  MIKRO_RENEW_URL: ${{ secrets.MIKRO_RENEW_URL }}
+  CUSTOM_RENEW_URL: ${{ secrets.CUSTOM_RENEW_URL }}
+  MIKRO_CLOUD_URL: ${{ secrets.MIKRO_CLOUD_URL }}
+  CUSTOM_CLOUD_URL: ${{ secrets.CUSTOM_CLOUD_URL }}
+  MIKRO_CLOUD2_URL: ${{ secrets.MIKRO_CLOUD2_URL }}
+  CUSTOM_CLOUD2_URL: ${{ secrets.CUSTOM_CLOUD2_URL }}
+
+jobs:
+  Patch_RouterOS:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # 只编译 x86
+        arch: ["x86"]
+      fail-fast: false
+    env:
+      TZ: 'Asia/Shanghai'
+      CHANNELS: ${{ inputs.channels }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ inputs.version }}
+      BUILD_TIME: ${{ inputs.buildtime }}
+      RELEASE: ${{ inputs.release }}
+      BUILD_DIR: "/tmp/build/${{ inputs.version }}"
+      PUBLISH_DIR: "${{ github.workspace }}/publish/${{ inputs.version }}"
+      PACKAGES: ""
+    steps:
+    - uses: actions/checkout@v6
+    - name: Setup environment
+      run: |
+        sudo apt-get update > /dev/null
+        sudo apt-get install -y zip unzip squashfs-tools jq > /dev/null
+        sudo apt-get install -y python3-crcmod python3-pefile python3-pyelftools > /dev/null
+
+        rm -rf "$BUILD_DIR"
+        mkdir -p "$BUILD_DIR"
+        echo "BUILD_DIR: $BUILD_DIR"
+
+        rm -rf "$PUBLISH_DIR"
+        mkdir -p "$PUBLISH_DIR"
+        echo "PUBLISH_DIR: $PUBLISH_DIR"
+
+        wget -nv -O $PUBLISH_DIR/CHANGELOG "https://${{ env.MIKRO_UPGRADE_URL }}/routeros/$VERSION/CHANGELOG"
+        cat $PUBLISH_DIR/CHANGELOG
+
+        wget -nv -O $BUILD_DIR/packages.csv "https://${{ env.MIKRO_UPGRADE_URL }}/routeros/$VERSION/packages.csv"
+        PACKAGES=$(grep "^$ARCH," $BUILD_DIR/packages.csv | cut -d',' -f2 | tr '\n' ' ')
+        rm $BUILD_DIR/packages.csv
+        echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+        echo "PACKAGES: $PACKAGES"
+
+    - name: Build Squashfs for Option and Python Package
+      run: |
+        echo "Creating Option Package Squashfs for arch: $ARCH"
+        mkdir -p $BUILD_DIR/option-root/bin/
+        install -m 755 ./busybox/busybox_$ARCH $BUILD_DIR/option-root/bin/busybox
+        install -m 755 ./keygen/keygen_$ARCH $BUILD_DIR/option-root/bin/keygen
+        chmod +x ./busybox/busybox_x86
+        COMMANDS=$(./busybox/busybox_x86 --list)
+        for cmd in $COMMANDS; do
+            ln -sf /pckg/option/bin/busybox $BUILD_DIR/option-root/bin/$cmd
+        done
+        mkdir -p $BUILD_DIR/option-root/home/web/webfig/
+        BUSYBOX=$(./busybox/busybox_x86 | head -1 | cut -d' ' -f2)
+        tee $BUILD_DIR/option.jg  > /dev/null << EOF
+        [
+            {
+                name:'Patch About',
+                title:'Patch About',
+                icon: 30,
+                prio: 2000,
+                c:[
+                    {
+                        title:'Patch About',
+                        type:'item',
+                        path:[24, 2],
+                        autorefresh: 1000, 
+                        ro: 1,
+                        c: [
+                            {type:'gridcell'},
+                            {name:'Patch',type:'tab',inline: 1},
+                            {name:'Author',type:'string',def:'elseif@live.cn'},
+                            {name:'GitHub',type:'string',def:'https://github.com/elseif/MikroTikPatch', url:1},
+                            {name:'Telegram',type:'string',def:'https://telegram.me/mikrotikpatch', url:1},
+                            {name:'Homepage',type:'string',def:'https://mikrotik.ltd', url:1},
+                            {name:'Busybox',type:'string',def:'$BUSYBOX'},
+                            {name:'System',type:'tab',inline: 1},
+                            {name:'Uptime',type:'interval',id:'u1'},
+                            {name:'Architecture Name',type:'string',id:'s1a'},
+                            {name:'Board Name',type:'string',id:'s2c'},
+                            {name:'Version',type:'version',id:'s16'},
+                            {name:'Build Time',type:'string',id:'s27'},
+                            {type:'separator'},
+                            {type:'toolbar',
+                                c: [
+                                    {name:'License',type:'contextmenu',autostart: 1,group:'System',link: [],open:'License',tab:'License'},
+                                    {name:'Check For Updates',type:'contextmenu',autostart: 1,group:'System',link: [],open:'Packages',tab:'Check For Updates'}
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+        EOF
+        HASH=$(python3 -E <<EOF
+        import hashlib, crcmod, sys
+        with open('$BUILD_DIR/option.jg','rb') as f:
+            data = f.read()
+            sha1 = hashlib.sha1(data).hexdigest()[:12]
+            crc = crcmod.mkCrcFun(0x104C11DB7, initCrc=0xFFFFFFFF, rev=False, xorOut=0xFFFFFFFF)(data)
+            print(f"{sha1} {crc}")
+        EOF
+        )
+        SHA1_PREFIX=$(echo "$HASH" | awk '{print $1}')
+        CRC=$(echo "$HASH" | awk '{print $2}')
+        mv $BUILD_DIR/option.jg $BUILD_DIR/option-$SHA1_PREFIX.jg
+        python3 -E << EOF
+        import gzip
+        gzip.open('$BUILD_DIR/option-$SHA1_PREFIX.jg.gz', 'wb', compresslevel=0).write(open('$BUILD_DIR/option-$SHA1_PREFIX.jg', 'rb').read())
+        EOF
+        SIZE=$(stat -c %s $BUILD_DIR/option-$SHA1_PREFIX.jg.gz)
+        mv $BUILD_DIR/option-$SHA1_PREFIX.jg.gz $BUILD_DIR/option-root/home/web/webfig/
+        tee $BUILD_DIR/option-root/home/web/webfig/option.info > /dev/null << EOF
+        { crc: $CRC, size: $SIZE, name: "option.jg", unique: "option-$SHA1_PREFIX.jg",version: "$VERSION" },
+        EOF
+        ln -sf option-$SHA1_PREFIX.jg.gz $BUILD_DIR/option-root/home/web/webfig/option.jg.gz
+        mksquashfs $BUILD_DIR/option-root $BUILD_DIR/option.sfs -no-recovery -noappend -exit-on-error -quiet -comp xz -no-xattrs -b 256k -all-root  
+        rm -rf $BUILD_DIR/option-root
+        echo "✅ Option Package Squashfs created: $BUILD_DIR/option.sfs"
+        ls -la "$BUILD_DIR/option.sfs"
+
+        if [ "$ARCH" == "x86" ]; then
+          wget -nv -O $BUILD_DIR/cpython.tar.gz -nv https://github.com/astral-sh/python-build-standalone/releases/download/20241206/cpython-3.11.11+20241206-x86_64-unknown-linux-musl-install_only_stripped.tar.gz
+        fi
+        tar -xzf $BUILD_DIR/cpython.tar.gz -C $BUILD_DIR
+        rm $BUILD_DIR/cpython.tar.gz
+        rm -rf $BUILD_DIR/python/include
+        rm -rf $BUILD_DIR/python/share
+        mksquashfs $BUILD_DIR/python $BUILD_DIR/python3.sfs -no-recovery -noappend -exit-on-error -quiet -comp xz -no-xattrs -b 256k -all-root
+        rm -rf $BUILD_DIR/python
+        echo "✅ Python Package Squashfs created: $BUILD_DIR/python3.sfs"
+        ls -la "$BUILD_DIR/python3.sfs"
+
+    - name: Cache mikrotik-${{ env.VERSION }}.iso
+      id: cache-mikrotik-iso
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.BUILD_DIR }}/mikrotik-${{ env.VERSION }}.iso
+        key: mikrotik-${{ env.VERSION }}.iso
+
+    - name: Get mikrotik-${{ env.VERSION }}.iso
+      if: steps.cache-mikrotik-iso.outputs.cache-hit != 'true'
+      run: |
+        wget -nv -O $BUILD_DIR/mikrotik-$VERSION.iso \
+            https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso
+
+    - name: Unpack ISO
+      run: |
+        mkdir -p $BUILD_DIR/all_packages
+        mkdir -p $BUILD_DIR/iso
+        mkdir -p $BUILD_DIR/new_iso
+        sudo mount -o loop,ro $BUILD_DIR/mikrotik-$VERSION.iso $BUILD_DIR/iso
+        cp -v $BUILD_DIR/iso/*.npk $BUILD_DIR/all_packages/
+        mv $BUILD_DIR/all_packages/routeros-$VERSION.npk $BUILD_DIR/
+        cp -v $BUILD_DIR/iso/efiboot.img $BUILD_DIR/new_iso/
+        cp -v $BUILD_DIR/iso/defpacks $BUILD_DIR/new_iso/ 
+        sudo umount $BUILD_DIR/iso
+        rm -rf $BUILD_DIR/iso
+
+    - name: Check and download missing packages
+      run: |
+        for pkg in $PACKAGES; do
+            PKG_FILE="${pkg}-$VERSION.npk"
+            PKG_PATH="$BUILD_DIR/all_packages/$PKG_FILE"
+            if [ ! -f "$PKG_PATH" ]; then
+                wget -nv -O "$PKG_PATH" "https://download.mikrotik.com/routeros/$VERSION/$PKG_FILE"
+                echo "✅ Package downloaded: $PKG_FILE"
+            fi
+        done
+
+    - name: Get loader patch files
+      run: |
+        wget -nv -O loader.7z https://${{ env.CUSTOM_UPGRADE_URL }}/routeros/loader.7z
+        sudo apt-get install -y p7zip-full > /dev/null
+        7z x -p"${{ secrets.LOADER_7Z_PASSWORD }}" loader.7z >> /dev/null
+        rm loader.7z
+
+    - name: Patch NPK files
+      run: |
+        sudo apt-get install build-essential binutils-arm-linux-gnueabi -y > /dev/null
+        chmod +w $BUILD_DIR/all_packages/*.npk
+        NPK_FILES=$(find $BUILD_DIR/all_packages/*.npk)
+        for file in $NPK_FILES; do
+            python3 npk.py sign $file $file
+        done
+        python3 npk.py create $BUILD_DIR/all_packages/gps-$VERSION.npk $BUILD_DIR/all_packages/option-$VERSION.npk option $BUILD_DIR/option.sfs -desc="busybox"
+        rm -rf $BUILD_DIR/option.sfs
+        python3 npk.py create $BUILD_DIR/all_packages/gps-$VERSION.npk $BUILD_DIR/all_packages/python3-$VERSION.npk python3 $BUILD_DIR/python3.sfs -desc="python 3.11.13"
+        rm -rf $BUILD_DIR/python3.sfs
+        echo "✅ all package npk files already signed: "
+        ls -la $BUILD_DIR/all_packages/*.npk
+        (cd $BUILD_DIR/all_packages && zip -r $PUBLISH_DIR/all_packages-$ARCH-$VERSION.zip .)
+        mv $BUILD_DIR/all_packages/*.npk $PUBLISH_DIR/
+        python3 patch.py npk $BUILD_DIR/routeros-$VERSION.npk -O $PUBLISH_DIR/routeros-$VERSION.npk
+        echo "✅ Main package npk file already patched: "
+        ls -la $PUBLISH_DIR/routeros-$VERSION.npk
+        rm -rf $BUILD_DIR/all_packages
+
+    - name: Cache NetInstall ${{ env.VERSION }}
+      if: matrix.arch == 'x86' && env.RELEASE == 'true'
+      id: cache-netinstall
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.BUILD_DIR }}/netinstall-${{ env.VERSION }}.zip
+        key: netinstall-${{ env.VERSION }}.zip
+
+    - name: Get netinstall ${{ env.VERSION }}
+      if: |
+        steps.cache-netinstall.outputs.cache-hit != 'true' && 
+        matrix.arch == 'x86' && env.RELEASE == 'true'
+      run: |
+        wget -nv -O $BUILD_DIR/netinstall-$VERSION.zip https://download.mikrotik.com/routeros/$VERSION/netinstall-$VERSION.zip
+
+    - name: Patch netinstall ${{ env.VERSION }}
+      if: matrix.arch == 'x86' && env.RELEASE == 'true'
+      run: |
+        unzip $BUILD_DIR/netinstall-$VERSION.zip -d $BUILD_DIR/
+        python3 patch.py netinstall $BUILD_DIR/netinstall.exe
+        (cd $BUILD_DIR && zip -r $PUBLISH_DIR/netinstall-$VERSION.zip netinstall.exe)
+        rm $BUILD_DIR/netinstall.exe
+
+    - name: Cache refind
+      if: matrix.arch == 'x86'
+      id: cache-refind
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.BUILD_DIR }}/refind-bin-0.14.2.zip
+        key: refind-bin-0.14.2.zip
+
+    - name: Get refind
+      if: matrix.arch == 'x86' && steps.cache-refind.outputs.cache-hit != 'true'
+      run: wget -nv -O $BUILD_DIR/refind-bin-0.14.2.zip https://downloads.sourceforge.net/project/refind/0.14.2/refind-bin-0.14.2.zip
+
+    - name: Build Alpine LiveCD
+      if: matrix.arch == 'x86'
+      run: |
+        set -e
+        YAML_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml"
+        ROOTFS_FILE=$(curl -sL "$YAML_URL" | grep -m1 'alpine-minirootfs.*\.tar\.gz' | awk '{print $NF}' | tr -d '"')
+        echo "$ROOTFS_FILE"
+        ROOTFS_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/$ROOTFS_FILE"
+        ROOTFS_DIR=$BUILD_DIR/rootfs
+        mkdir -p $ROOTFS_DIR
+        curl -# -L "$ROOTFS_URL" | tar -xzC $ROOTFS_DIR
+
+        sudo mount -v --bind /dev $ROOTFS_DIR/dev
+        sudo mount -vt sysfs sysfs $ROOTFS_DIR/sys
+        sudo mount -vt proc proc $ROOTFS_DIR/proc
+
+        cat << 'EOF' > $ROOTFS_DIR/etc/network/interfaces
+        auto lo
+        iface lo inet loopback
+        auto eth0
+        iface eth0 inet dhcp
+        EOF
+
+        cat << 'EOF' > $ROOTFS_DIR/etc/inittab
+        # /etc/inittab
+        ::sysinit:/sbin/openrc sysinit
+        ::sysinit:/sbin/openrc boot
+        ::wait:/sbin/openrc default
+        tty1::respawn:/sbin/agetty --autologin root tty1 linux
+        tty2::respawn:/sbin/agetty tty2 linux
+        tty3::respawn:/sbin/agetty tty3 linux
+        tty4::respawn:/sbin/agetty tty4 linux
+        ttyS0::respawn:/sbin/agetty ttyS0 linux
+        ::ctrlaltdel:/sbin/reboot
+        ::shutdown:/sbin/openrc shutdown
+        EOF
+
+        install -m 755 ./setup-routeros.sh $ROOTFS_DIR/usr/local/bin/setup-routeros
+        install -m 755 ./npkextract/npkextract $ROOTFS_DIR/usr/local/bin/npkextract
+
+        cat << 'EOF' > $ROOTFS_DIR/root/.zprofile
+        if command -v setup-routeros >/dev/null 2>&1; then
+            setup-routeros
+        fi
+        EOF
+
+        cat << 'EOF' | sudo chroot $ROOTFS_DIR /usr/bin/env PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/sh
+        set -e
+        echo "nameserver 1.1.1.1" > /etc/resolv.conf
+        apk update
+        apk upgrade
+        apk add alpine-base openrc busybox-mdev-openrc dhcpcd curl ca-certificates linux-lts linux-firmware-none
+        apk add bash dialog sgdisk dosfstools e2fsprogs util-linux parted
+        apk add zsh zsh-syntax-highlighting zsh-autosuggestions coreutils ncurses iproute2
+
+        rc-update add devfs sysinit
+        rc-update add dmesg sysinit
+        rc-update add mdev sysinit
+        rc-update add hwdrivers sysinit
+        rc-update add acpid boot
+        rc-update add hostname boot
+        rc-update add hwclock boot
+        rc-update add modules boot
+        rc-update add sysctl boot
+        rc-update add bootmisc boot
+        rc-update add dhcpcd boot
+        rc-update add networking default
+
+        curl -o /root/.zshrc https://gitlab.com/kalilinux/packages/kali-defaults/-/raw/kali/master/etc/skel/.zshrc
+        sed -i 's/^PROMPT_ALTERNATIVE=twoline/PROMPT_ALTERNATIVE=oneline/' /root/.zshrc
+        sed -i 's/^NEWLINE_BEFORE_PROMPT=yes/NEWLINE_BEFORE_PROMPT=no/' /root/.zshrc
+        sed -i 's|/usr/share/zsh-syntax-highlighting|/usr/share/zsh/plugins/zsh-syntax-highlighting|g' /root/.zshrc
+        sed -i 's|/usr/share/zsh-autosuggestions|/usr/share/zsh/plugins/zsh-autosuggestions|g' /root/.zshrc
+
+        sed -i 's|^root:\(.*\):/bin/sh$|root:\1:/bin/zsh|' /etc/passwd
+        sed -i 's/^root:.*/root:::0:::::/' /etc/shadow
+        printf 'Welcome to Alpine!\n\nTo start the RouterOS installation wizard, run: setup-routeros\n\n' > /etc/motd
+  
+        sed -i 's/^features=.*/features="ata base cdrom network scsi nvme ext2 usb virtio"/' /etc/mkinitfs/mkinitfs.conf
+        KERNEL_VERSION=$(ls /lib/modules | head -1)
+        mkinitfs -k -t /tmp "$KERNEL_VERSION"
+        rm -rf /lib/modules
+        mv /tmp/lib/modules /lib
+        depmod "$KERNEL_VERSION"
+        ln -sf sbin/init /init
+
+        apk cache clean
+        EOF
+
+        sudo umount -v $ROOTFS_DIR/dev
+        sudo umount -v $ROOTFS_DIR/sys
+        sudo umount -v $ROOTFS_DIR/proc
+
+        cp $ROOTFS_DIR/boot/vmlinuz-* $BUILD_DIR/vmlinuz
+
+        sudo rm -rf $ROOTFS_DIR/tmp/*
+        sudo rm -rf $ROOTFS_DIR/boot/*
+        sudo rm -rf $ROOTFS_DIR/var/cache/*
+
+        (cd "$ROOTFS_DIR" && sudo find . -print0 | sudo cpio --owner=root:root --null -H newc -o 2>/dev/null | xz -C crc32 -v9eT0 > $BUILD_DIR/initramfs.xz)
+        sudo rm -rf $ROOTFS_DIR
+
+        size=$(stat -c %s "$BUILD_DIR/vmlinuz")
+        printf "vmlinuz size : %d bytes (%.1f MB)\n" "$size" "$(echo "scale=1; $size/1024/1024" | bc)"
+        size=$(stat -c %s "$BUILD_DIR/initramfs.xz")
+        printf "initramfs size : %d bytes (%.1f MB)\n" "$size" "$(echo "scale=1; $size/1024/1024" | bc)"
+
+    - name: Build ISO & INSTALL image files
+      run: |
+        set -e
+        sudo modprobe nbd
+        sudo apt-get install isolinux syslinux syslinux-common xorriso dosfstools qemu-utils -y > /dev/null
+        cp -v $PUBLISH_DIR/routeros-$VERSION.npk $BUILD_DIR/new_iso/
+        unzip $PUBLISH_DIR/all_packages-$ARCH-$VERSION.zip -d $BUILD_DIR/new_iso/
+        mkdir $BUILD_DIR/efiboot
+        if [ "$ARCH" == "x86" ]; then
+            echo "Creating x86 ISO..."
+            mkdir -p $BUILD_DIR/new_iso/isolinux
+            cp -v /usr/lib/ISOLINUX/isolinux.bin $BUILD_DIR/new_iso/isolinux/
+            cp -v /usr/lib/syslinux/modules/bios/ldlinux.c32 $BUILD_DIR/new_iso/isolinux/
+            cp -v /usr/lib/syslinux/modules/bios/libutil.c32 $BUILD_DIR/new_iso/isolinux/
+            cp -v /usr/lib/syslinux/modules/bios/menu.c32 $BUILD_DIR/new_iso/isolinux/
+            tee $BUILD_DIR/new_iso/isolinux/isolinux.cfg > /dev/null << 'EOF'
+        UI menu.c32
+        MENU TITLE MikroTik RouterOS Install CDROM
+        MENU CLEAR
+        DEFAULT system
+        TIMEOUT 0
+        LABEL system
+            MENU LABEL Install RouterOS
+            KERNEL linux
+            APPEND load_ramdisk=1 root=/dev/ram0 -install -cdrom
+        LABEL alpine
+            MENU LABEL Boot Alpine Linux
+            KERNEL vmlinuz
+            APPEND initrd=initramfs.xz
+        EOF
+            cp -v $BUILD_DIR/vmlinuz $BUILD_DIR/new_iso/isolinux/vmlinuz
+            cp -v $BUILD_DIR/initramfs.xz $BUILD_DIR/new_iso/isolinux/initramfs.xz
+
+            sudo mount -o loop $BUILD_DIR/new_iso/efiboot.img $BUILD_DIR/efiboot
+            python3 patch.py kernel $BUILD_DIR/efiboot/linux.x86_64 -O $BUILD_DIR/new_iso/isolinux/linux
+            sudo umount $BUILD_DIR/efiboot
+            rm -f $BUILD_DIR/new_iso/efiboot.img
+            truncate --size 64M $BUILD_DIR/new_iso/efiboot.img
+            mkfs.vfat -n "Boot" $BUILD_DIR/new_iso/efiboot.img
+            sudo mount -o loop,uid=$(id -u),gid=$(id -g) $BUILD_DIR/new_iso/efiboot.img $BUILD_DIR/efiboot
+            mkdir -p $BUILD_DIR/efiboot/EFI/BOOT
+            unzip -j $BUILD_DIR/refind-bin-0.14.2.zip "refind-bin-0.14.2/refind/refind_x64.efi" -d $BUILD_DIR/efiboot/EFI/BOOT/
+            mv $BUILD_DIR/efiboot/EFI/BOOT/refind_x64.efi $BUILD_DIR/efiboot/EFI/BOOT/BOOTX64.EFI
+            tee $BUILD_DIR/efiboot/EFI/BOOT/refind.conf > /dev/null << 'EOF'
+        timeout 0
+        textonly
+        textmode 0
+        showtools shutdown, reboot, exit
+        menuentry "Install RouterOS" {
+            loader /linux.x86_64
+            options "load_ramdisk=1 root=/dev/ram0 -install -cdrom debug"
+        }
+        menuentry "Alpine Linux" {
+            loader /vmlinuz
+            initrd /initramfs.xz
+        }
+        default_selection /EFI/BOOT/BOOTX64.EFI
+        EOF
+            cp -v $BUILD_DIR/new_iso/isolinux/linux $BUILD_DIR/efiboot/linux.x86_64 
+            cp -v $BUILD_DIR/vmlinuz $BUILD_DIR/efiboot/vmlinuz
+            cp -v $BUILD_DIR/initramfs.xz $BUILD_DIR/efiboot/initramfs.xz
+            sync
+            sudo umount $BUILD_DIR/efiboot
+
+            xorriso -as mkisofs -o $PUBLISH_DIR/mikrotik-$VERSION.iso \
+                        -V 'MikroTik' \
+                        -publisher "WWW.MIKROTIK.COM" \
+                        -preparer "MIKROTIK" \
+                        -A "MIKROTIK_ROUTER" \
+                        -sysid "" \
+                        -b 'isolinux/isolinux.bin' \
+                        -c 'isolinux/boot.cat' \
+                        -no-emul-boot \
+                        -boot-load-size 4 \
+                        -eltorito-alt-boot \
+                        -e efiboot.img \
+                        -no-emul-boot \
+                        -boot-load-size 2048 \
+                        -R -J \
+                        -input-charset utf-8 \
+                        -iso-level 3 \
+                        $BUILD_DIR/new_iso
+            echo "✅ ISO created: "
+            ls -la $PUBLISH_DIR/mikrotik-$VERSION.iso
+
+            echo "Creating x86 install..."
+            truncate --size 128M $BUILD_DIR/install-image-$VERSION.img
+            mkfs.vfat -I -F 32 -n "Install" $BUILD_DIR/install-image-$VERSION.img
+            LOOP=$(sudo losetup -f --show $BUILD_DIR/install-image-$VERSION.img)
+            sudo syslinux --install $LOOP
+            mkdir -p $BUILD_DIR/install
+            sudo mount -o loop,uid=$(id -u),gid=$(id -g),umask=000 $LOOP $BUILD_DIR/install
+            cp -vf $BUILD_DIR/new_iso/isolinux/linux $BUILD_DIR/install/
+            cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 $BUILD_DIR/install/
+            mkdir -p $BUILD_DIR/install/EFI/BOOT
+            unzip -j $BUILD_DIR/refind-bin-0.14.2.zip "refind-bin-0.14.2/refind/refind_x64.efi" -d $BUILD_DIR/install/EFI/BOOT
+            mv $BUILD_DIR/install/EFI/BOOT/refind_x64.efi $BUILD_DIR/install/EFI/BOOT/BOOTX64.EFI
+            tee $BUILD_DIR/install/EFI/BOOT/refind.conf > /dev/null << 'EOF'
+        timeout 0
+        textonly
+        textmode 0
+        showtools shutdown, reboot, exit
+        menuentry "Install RouterOS" {
+        	loader /linux
+        	options "load_ramdisk=1 root=/dev/ram0 -install -hdd"
+        }
+        default_selection /EFI/BOOT/BOOTX64.EFI
+        EOF
+            tee $BUILD_DIR/install/syslinux.cfg > /dev/null << 'EOF'
+        default system
+        label system
+        	kernel linux
+        	append load_ramdisk=1 -install -hdd
+        EOF
+            NPK_FILES=($(find $BUILD_DIR/new_iso/*.npk))
+            for ((i=1; i<=${#NPK_FILES[@]}; i++))
+            do
+                echo "${NPK_FILES[$i-1]}=>$i.npk" 
+                cp ${NPK_FILES[$i-1]} $BUILD_DIR/install/$i.npk
+            done
+            touch $BUILD_DIR/install/CHOOSE
+            touch $BUILD_DIR/install/autorun.scr 
+            sync
+            sudo umount $BUILD_DIR/install
+            sudo losetup -d $LOOP
+            rm -rf $BUILD_DIR/install
+            echo "✅ install imgage created: "
+            ls -la $BUILD_DIR/install-image-$VERSION.img
+            (cd $BUILD_DIR && zip $PUBLISH_DIR/install-image-$VERSION.zip install-image-$VERSION.img)
+            rm $BUILD_DIR/install-image-$VERSION.img
+        fi
+        rm -rf $BUILD_DIR/new_iso
+        rm -rf $BUILD_DIR/efiboot
+
+    - name: Upload Files as Artifact (No Release)
+      if: env.RELEASE == 'false'
+      uses: actions/upload-artifact@v7
+      with:
+        name: mikrotik-${{ env.VERSION }}
+        path: |
+          ${{ env.PUBLISH_DIR }}/*.zip
+          ${{ env.PUBLISH_DIR }}/*.iso
+
+    - name: Generate SHA256 checksum files
+      if: env.RELEASE == 'true'
+      run: |
+        (
+          cd $PUBLISH_DIR
+          for file in *.zip *.iso *.npk; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" > "$file.sha256"
+              cat "$file.sha256"
+            fi
+          done
+        )
+
+    - name: Delete Release tag ${{ env.VERSION }}
+      if: env.RELEASE == 'true'
+      run: |
+        HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+        RELEASE_INFO=$(curl -s -H "$HEADER" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
+        RELEASE_ID=$(echo $RELEASE_INFO | jq -r '.id')
+        echo "Release ID: $RELEASE_ID"
+        if [ "$RELEASE_ID" != "null" ]; then
+            curl -X DELETE -H "$HEADER" https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$VERSION
+            echo "Tag $VERSION deleted successfully."
+            curl -X DELETE -H "$HEADER" https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID
+            echo "Release with tag $VERSION deleted successfully."
+            # Wait for a moment to ensure the deletion is complete
+            sleep 3
+        else
+            echo "Release not found for tag: $VERSION)"
+        fi
+
+    - name: Generate Release Body
+      if: env.RELEASE == 'true'
+      run: |
+        RELEASE_BODY="$BUILD_DIR/RELEASE_BODY.md"
+        BASE_URL="https://github.com/${{ github.repository }}/releases/download/$VERSION"
+        BUILD_TIME_UTC=$(date -u -d "@$BUILD_TIME" "+%Y-%m-%d %H:%M:%S UTC" 2>/dev/null || echo "Invalid timestamp")
+
+        link_file() {
+          local file="$1"
+          if [ -f "$file" ]; then
+            local basename=$(basename "$file")
+            echo "[$basename]($BASE_URL/$basename)"
+          else
+            echo "N/A"
+          fi
+        }
+        CHANNELS_TEXT=$(echo "$CHANNELS" | jq -r 'map("`\(.)`") | join(" ")')
+        ARCH_TEXT="\`$ARCH\`"
+
+        cat > "$RELEASE_BODY" << EOF
+        **Architecture**: $ARCH_TEXT
+        **Channel**: $CHANNELS_TEXT
+        **Build Time**: $BUILD_TIME_UTC ($BUILD_TIME)
+
+        <details open><summary><strong>RouterOS</strong></summary>
+
+        | Type | File |
+        |------|------|
+        EOF
+        
+        echo "| Main package | $(link_file "$PUBLISH_DIR/routeros-${VERSION}.npk") |" >> "$RELEASE_BODY"
+        echo "| Extra packages	 | $(link_file "$PUBLISH_DIR/all_packages-$ARCH-$VERSION.zip") |" >> "$RELEASE_BODY"
+        if [ "$ARCH" == "x86" ]; then
+          echo "| ISO Image | $(link_file "$PUBLISH_DIR/mikrotik-${VERSION}.iso") |" >> "$RELEASE_BODY"
+          echo "| Install Image | $(link_file "$PUBLISH_DIR/install-image-$VERSION.zip") |" >> "$RELEASE_BODY"
+          echo "| Netinstall | $(link_file "$PUBLISH_DIR/netinstall-$VERSION.zip") |" >> "$RELEASE_BODY"
+        fi
+        echo "</details>" >> "$RELEASE_BODY"
+        echo "" >> "$RELEASE_BODY"
+
+        echo "<details><summary><strong>Changelog</strong> (click to expand)</summary>" >> "$RELEASE_BODY"
+        echo "" >> "$RELEASE_BODY"
+        echo "<pre>" >> "$RELEASE_BODY"
+        cat "$PUBLISH_DIR/CHANGELOG" >> "$RELEASE_BODY"
+        echo "</pre>" >> "$RELEASE_BODY"
+        echo "</details>" >> "$RELEASE_BODY"
+        echo "📄 Release body content:"
+        cat "$RELEASE_BODY"
+
+    - name: Create Release tag ${{ env.VERSION }}
+      if: env.RELEASE == 'true'
+      uses: softprops/action-gh-release@v3
+      with:
+        name: "RouterOS ${{ env.VERSION }}"
+        repository: ${{ github.repository }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        body_path: ${{env.BUILD_DIR}}/RELEASE_BODY.md
+        tag_name: ${{ env.VERSION }}
+        make_latest:  ${{ contains(fromJSON(env.CHANNELS), 'stable') && env.ARCH == 'x86' }}
+        prerelease: ${{ !contains(fromJSON(env.CHANNELS), 'stable') && !contains(fromJSON(env.CHANNELS), 'long-term') }}
+        files: |
+          ${{env.PUBLISH_DIR}}/*.zip
+          ${{env.PUBLISH_DIR}}/*.zip.sha256
+          ${{env.PUBLISH_DIR}}/*.iso
+          ${{env.PUBLISH_DIR}}/*.iso.sha256
+          ${{env.PUBLISH_DIR}}/routeros*.npk
+          ${{env.PUBLISH_DIR}}/routeros*.npk.sha256
