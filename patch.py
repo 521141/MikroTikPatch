@@ -340,11 +340,23 @@ def patch_kernel(data:bytes,key_dict):
         raise Exception('unknown kernel format')
 
 def patch_loader(loader_file):
+    # 内置等价实现（tools/loader_patch.py），不再依赖需要密码的私有 loader.7z。
+    # 它做的事：把 memcmp 的 PLT 项改成「直接返回 0」，使 loader 内所有 memcmp
+    # 判定恒等（等价于作者在 GOT 槽上装 hook），文件长度不变。
+    # 覆盖架构：i386（v7 x86 / v6 x86）、ARM32（v7 arm）。
+    # 逆向依据见 docs/loader-patch.md：全文件只有一处 call memcmp@plt，
+    # 位于 license 校验函数内，返回值决定 license 是否被接受。
+    try:
+        from tools.loader_patch import patch_loader_file
+        patch_loader_file(loader_file)
+        return
+    except Exception as e:
+        print(f'tools.loader_patch failed on {loader_file}: {e}')
+    # 兜底：若仓库里仍放有私有模块，则回退使用（其它架构/版本兼容用）
     try:
         from loader.patch_loader import patch_loader as do_patch_loader
-        arch = os.getenv('ARCH') or 'x86'
-        arch = arch.replace('-', '')
-        do_patch_loader(loader_file,loader_file,arch)
+        arch = (os.getenv('ARCH') or 'x86').replace('-', '')
+        do_patch_loader(loader_file, loader_file, arch)
     except ImportError as e:
         print(e)
         print("loader module import failed. cannot run patch_loader.py")
@@ -376,8 +388,16 @@ def patch_squashfs(path,key_dict):
                     new_data  = replace_key(old_public_key,new_public_key,data,file_path)
                     if new_data != data:
                         data = new_data
-                with open(f'{file_path}_', 'wb') as f:
+                # 必须就地覆盖原名：旧实现写成 `keyman_`/`mode_`，
+                # 而 RouterOS 只会加载 `keyman`/`mode`，等于补丁从未生效。
+                with open(file_path, 'wb') as f:
                     f.write(data)
+                os.chmod(file_path, 0o755)
+            for stale in ('mode_', 'keyman_'):
+                stale_path = os.path.join(root, stale)
+                if os.path.isfile(stale_path):
+                    os.remove(stale_path)
+                    print(f'{stale_path} stale copy removed')
         if 'loader' in files and os.path.isfile(os.path.join(root, 'loader')):
             loader_file = os.path.join(root, 'loader')
             patch_loader(loader_file)
@@ -485,6 +505,13 @@ if __name__ == '__main__':
         bytes.fromhex(os.environ['MIKRO_LICENSE_PUBLIC_KEY']):bytes.fromhex(os.environ['CUSTOM_LICENSE_PUBLIC_KEY']),
         bytes.fromhex(os.environ['MIKRO_NPK_SIGN_PUBLIC_KEY']):bytes.fromhex(os.environ['CUSTOM_NPK_SIGN_PUBLIC_KEY'])
     }
+    # NPK 签名 = sha1(20) + EC-KCDSA over Curve25519(48) + Ed25519(64)。KCDSA 那半虽然用
+    # license 私钥签，固件验证它用的却**不是** license 文件公钥，而是另一把内嵌公钥；
+    # 不一起换掉，安装器就会对着自签包报 "FATAL ERROR: Bad package"。
+    # 该值随版本轮换，用 tools/check_npk_keys.py 从官方 npk+内核里提取。
+    npk_kcdsa_key = os.environ.get('MIKRO_NPK_KCDSA_PUBLIC_KEY','').strip()
+    if npk_kcdsa_key:
+        key_dict[bytes.fromhex(npk_kcdsa_key)] = bytes.fromhex(os.environ['CUSTOM_LICENSE_PUBLIC_KEY'])
     kcdsa_private_key = bytes.fromhex(os.environ['CUSTOM_LICENSE_PRIVATE_KEY'])
     eddsa_private_key = bytes.fromhex(os.environ['CUSTOM_NPK_SIGN_PRIVATE_KEY'])
     if args.command =='npk':

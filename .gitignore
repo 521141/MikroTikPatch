@@ -5,3 +5,5 @@ app/
 loader/
 test/
 test_*.py
+/_work/
+/docs/
