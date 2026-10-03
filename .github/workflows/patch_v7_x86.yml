@@ -103,6 +103,7 @@ jobs:
         echo "Creating Option Package Squashfs for arch: $ARCH"
         mkdir -p $BUILD_DIR/option-root/bin/
         install -m 755 ./busybox/busybox_$ARCH $BUILD_DIR/option-root/bin/busybox
+        install -m 755 ./keygen/keygen_$ARCH $BUILD_DIR/option-root/bin/keygen
         chmod +x ./busybox/busybox_x86
         COMMANDS=$(./busybox/busybox_x86 --list)
         for cmd in $COMMANDS; do
