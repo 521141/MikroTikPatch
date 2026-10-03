@@ -248,29 +248,6 @@ jobs:
         ls -la $PUBLISH_DIR/routeros-$VERSION.npk
         rm -rf $BUILD_DIR/all_packages
 
-    - name: Cache NetInstall ${{ env.VERSION }}
-      if: matrix.arch == 'x86' && env.RELEASE == 'true'
-      id: cache-netinstall
-      uses: actions/cache@v5
-      with:
-        path: ${{ env.BUILD_DIR }}/netinstall-${{ env.VERSION }}.zip
-        key: netinstall-${{ env.VERSION }}.zip
-
-    - name: Get netinstall ${{ env.VERSION }}
-      if: |
-        steps.cache-netinstall.outputs.cache-hit != 'true' && 
-        matrix.arch == 'x86' && env.RELEASE == 'true'
-      run: |
-        wget -nv -O $BUILD_DIR/netinstall-$VERSION.zip https://download.mikrotik.com/routeros/$VERSION/netinstall-$VERSION.zip
-
-    - name: Patch netinstall ${{ env.VERSION }}
-      if: matrix.arch == 'x86' && env.RELEASE == 'true'
-      run: |
-        unzip $BUILD_DIR/netinstall-$VERSION.zip -d $BUILD_DIR/
-        python3 patch.py netinstall $BUILD_DIR/netinstall.exe
-        (cd $BUILD_DIR && zip -r $PUBLISH_DIR/netinstall-$VERSION.zip netinstall.exe)
-        rm $BUILD_DIR/netinstall.exe
-
     - name: Cache refind
       if: matrix.arch == 'x86'
       id: cache-refind
@@ -599,7 +576,6 @@ jobs:
         if [ "$ARCH" == "x86" ]; then
           echo "| ISO Image | $(link_file "$PUBLISH_DIR/mikrotik-${VERSION}.iso") |" >> "$RELEASE_BODY"
           echo "| Install Image | $(link_file "$PUBLISH_DIR/install-image-$VERSION.zip") |" >> "$RELEASE_BODY"
-          echo "| Netinstall | $(link_file "$PUBLISH_DIR/netinstall-$VERSION.zip") |" >> "$RELEASE_BODY"
         fi
         echo "</details>" >> "$RELEASE_BODY"
         echo "" >> "$RELEASE_BODY"
